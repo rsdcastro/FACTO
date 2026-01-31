@@ -1299,6 +1299,56 @@ SpecDB = [
         ],
     ),
     Spec(
+        op="binary_cross_entropy_backward.default",  # (Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean) -> Tensor
+        inspec=[
+            InPosArg(
+                ArgType.Tensor,
+                name="grad_output",
+                constraints=[
+                    cp.Dtype.In(lambda deps: dt._floating),
+                ],
+            ),
+            InPosArg(
+                ArgType.Tensor,
+                name="self",
+                deps=[0],
+                constraints=[
+                    cp.Dtype.Eq(lambda deps: deps[0].dtype),
+                    cp.Rank.Eq(lambda deps: len(deps[0].shape)),
+                    cp.Size.Eq(lambda deps, r, d: deps[0].shape[d]),
+                ],
+            ),
+            InPosArg(
+                ArgType.Tensor,
+                name="target",
+                deps=[0, 1],
+                constraints=[
+                    cp.Dtype.Eq(lambda deps: deps[0].dtype),
+                    cp.Rank.Eq(lambda deps: len(deps[1].shape)),
+                    cp.Size.Eq(lambda deps, r, d: deps[1].shape[d]),
+                ],
+            ),
+            InPosArg(
+                ArgType.TensorOpt,
+                name="weight",
+                deps=[0, 1],
+                constraints=[
+                    cp.Dtype.Eq(lambda deps: deps[0].dtype),
+                    cp.Rank.Eq(lambda deps: len(deps[1].shape)),
+                    cp.Size.Eq(lambda deps, r, d: deps[1].shape[d]),
+                ],
+            ),
+            InPosArg(
+                ArgType.Int,
+                name="reduction",
+                constraints=[
+                    cp.Value.In(lambda deps: [0, 1, 2]),
+                ],
+            ),
+        ],
+        outspec=[OutArg(ArgType.Tensor)],
+    ),
+    Spec(
         op="bitwise_and.Scalar",  # (Tensor self, Scalar other) -> Tensor
         inspec=[
             InPosArg(
@@ -2583,6 +2633,30 @@ SpecDB = [
         outspec=[OutArg(ArgType.Tensor)],
     ),
     Spec(
+        op="hardshrink.default",  # (Tensor self, Scalar lambd=0.5) -> Tensor
+        inspec=[
+            InPosArg(
+                ArgType.Tensor,
+                name="self",
+                constraints=[
+                    cp.Dtype.In(lambda deps: dt._floating),
+                ],
+            ),
+            InPosArg(
+                ArgType.Scalar,
+                name="lambd",
+                constraints=[
+                    cp.Value.Ge(lambda deps, dtype: 0),
+                    # Upper bound to prevent overflow when converting to float16
+                    #
+                    # Default value for lambd in this operator is 0.5
+                    cp.Value.Le(lambda deps, dtype: 100),
+                ],
+            ),
+        ],
+        outspec=[OutArg(ArgType.Tensor)],
+    ),
+    Spec(
         op="hardtanh.default",  # (Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
         inspec=[
             InPosArg(
@@ -2844,6 +2918,242 @@ SpecDB = [
         ],
         outspec=[
             OutArg(ArgType.Tensor),
+        ],
+    ),
+    Spec(
+        # lstm.data: LSTM for packed sequences (from pack_padded_sequence)
+        # Signature: (Tensor data, Tensor batch_sizes, Tensor[] hx, Tensor[] params,
+        #             bool has_biases, int num_layers, float dropout, bool train,
+        #             bool bidirectional) -> (Tensor, Tensor, Tensor)
+        #
+        # Matrix multiplication constraints:
+        #   - gates = input @ w_ih.T + hidden @ w_hh.T + biases
+        #   - w_ih: (4*H, I) where I = input_size = data.size(1)
+        #   - w_hh: (4*H, P) where P = proj_size = hx[0].size(2)
+        #   - For simplicity, we set I = P so both weights can share dim 1 size
+        #
+        # Params ordering per layer per direction:
+        #   - has_biases=True, has_proj: [w_ih, w_hh, b_ih, b_hh, w_hr] (5 tensors)
+        #   - has_biases=True, no proj:  [w_ih, w_hh, b_ih, b_hh] (4 tensors)
+        #   - has_biases=False, has_proj: [w_ih, w_hh, w_hr] (3 tensors)
+        #   - has_biases=False, no proj:  [w_ih, w_hh] (2 tensors)
+        op="lstm.data",
+        inspec=[
+            # data: packed input sequence
+            # Shape: (total_timesteps, input_size) where total_timesteps = sum(batch_sizes)
+            InPosArg(
+                ArgType.Tensor,
+                name="data",
+                deps=[1, 2],  # [batch_sizes, hx]
+                constraints=[
+                    # dtype must match hx to avoid "expected m1 and m2 to have the same dtype"
+                    cp.Dtype.Eq(lambda deps: deps[1][0].dtype),
+                    cp.Rank.Eq(lambda deps: 2),
+                    # dim 0: total_timesteps = sum(batch_sizes) = 10 (fixed)
+                    cp.Size.Eq(lambda deps, r, d: 10 if d == 0 else None),
+                    # dim 1: input_size = hidden_size = 8 (fixed)
+                    # This ensures w_ih and w_hh can share same dim 1 (TensorList limitation)
+                    cp.Size.Eq(lambda deps, r, d: 8 if d == 1 else None),
+                ],
+            ),
+            # batch_sizes: 1D tensor of batch sizes per timestep
+            # Shape: (sequence_length,), values sorted descending, all >= 1
+            # For packed sequences: data.size(0) = sum(batch_sizes)
+            InPosArg(
+                ArgType.Tensor,
+                name="batch_sizes",
+                constraints=[
+                    # batch_sizes must always be int64 (Long) - use Eq not In to enforce strictly
+                    cp.Dtype.Eq(lambda deps: torch.int64),
+                    cp.Rank.Eq(lambda deps: 1),
+                    cp.Size.Eq(lambda deps, r, d: 1),  # single element (sequence_length=1)
+                    # Fix value to 10 to match data.size(0) = 10 and hx batch_size = 10
+                    cp.Value.Eq(lambda deps, dtype, struct: 10),
+                ],
+            ),
+            # hx: [h_0, c_0] initial hidden and cell states
+            # h_0: (num_layers * num_directions, batch_size, hidden_size)
+            # c_0: (num_layers * num_directions, batch_size, hidden_size)
+            InPosArg(
+                ArgType.TensorList,
+                name="hx",
+                deps=[5, 8, 1],  # [num_layers, bidirectional, batch_sizes]
+                constraints=[
+                    cp.Length.Eq(lambda deps: 2),
+                    cp.Dtype.In(lambda deps: dt._floating),
+                    cp.Rank.Eq(lambda deps, length, ix: 3),
+                    # dim 0: num_layers * num_directions (dynamic based on bidirectional)
+                    cp.Size.Eq(lambda deps, r, d: deps[0] * (2 if deps[1] else 1) if d == 0 else None),
+                    # dim 1: batch_size = 10 (fixed, must match data.size(0))
+                    cp.Size.Eq(lambda deps, r, d: 10 if d == 1 else None),
+                    # dim 2: hidden_size = 8 (fixed, must match data.size(1) and params)
+                    cp.Size.Eq(lambda deps, r, d: 8 if d == 2 else None),
+                ],
+            ),
+            # params: weight and bias tensors
+            # For has_biases=False: [w_ih, w_hh] per layer per direction (2 tensors)
+            # For has_biases=True: [w_ih, w_hh, b_ih, b_hh] per layer per direction (4 tensors)
+            # w_ih: (4*H, I) = (32, 8), w_hh: (4*H, H) = (32, 8)
+            # b_ih: (4*H,) = (32,), b_hh: (4*H,) = (32,)
+            InPosArg(
+                ArgType.TensorList,
+                name="params",
+                deps=[0, 2, 4, 8, 5],  # [data, hx, has_biases, bidirectional, num_layers]
+                constraints=[
+                    cp.Dtype.Eq(lambda deps: deps[0].dtype),
+                    # Length: (4 if has_biases else 2) * num_layers * num_directions
+                    cp.Length.Eq(lambda deps: (4 if deps[2] else 2) * deps[4] * (2 if deps[3] else 1)),
+                    # Rank: weights are rank 2 (indices 0,1 in each group), biases are rank 1 (indices 2,3)
+                    # Group size is 4 if has_biases else 2
+                    cp.Rank.Eq(lambda deps, length, ix: 2 if (ix % (4 if deps[2] else 2)) < 2 else 1),
+                    # Size dim 0: 4 * hidden_size = 32 (for both weights and biases)
+                    cp.Size.Eq(lambda deps, r, d: 32 if d == 0 else None),
+                    # Size dim 1: input_size = hidden_size = 8 (only for weights, rank 2)
+                    cp.Size.Eq(lambda deps, r, d: deps[0].size(1) if d == 1 else None),
+                ],
+            ),
+            # has_biases: whether bias tensors are included in params
+            InPosArg(ArgType.Bool, name="has_biases"),
+            # num_layers: number of stacked LSTM layers
+            # Fixed to 1 to ensure all weight tensors have consistent dimensions
+            # (multi-layer bidirectional LSTM has different w_ih sizes for layer 0 vs layer 1+)
+            #
+            # For bidirectional LSTM with multi-layer support, the weight dimensions are different across layers:
+            #
+            #  Layer 0:
+            #  - w_ih: (4*H, input_size)
+            #  - w_hh: (4*H, H)
+            #
+            #  Layer 1+ (bidirectional):
+            #  - w_ih: (4H, H2) - input comes from concatenated bidirectional output
+            #  - w_hh: (4*H, H)
+            #
+            # Since TensorList Size constraints can't distinguish between tensors, we have a fundamental limitation.
+            # The solution is: allow num_layers >= 1, but restrict bidirectional=True to num_layers=1 only.
+            # For unidirectional with input_size=hidden_size, all layers have same weight dimensions.
+            InPosArg(
+                ArgType.Int,
+                name="num_layers",
+                constraints=[cp.Value.Ge(lambda deps: 1)],
+            ),
+            # dropout: dropout probability (only applied between layers if num_layers > 1)
+            InPosArg(
+                ArgType.Float,
+                name="dropout",
+                constraints=[
+                    cp.Value.Ge(lambda deps: 0.0),
+                    cp.Value.Le(lambda deps: 1.0),
+                ],
+            ),
+            # train: whether in training mode
+            InPosArg(ArgType.Bool, name="train"),
+            # bidirectional: whether to use bidirectional LSTM
+            # Only allow True when num_layers == 1 (multi-layer bidirectional has different w_ih sizes)
+            InPosArg(
+                ArgType.Bool,
+                name="bidirectional",
+                deps=[5],  # [num_layers]
+                constraints=[
+                    # When num_layers > 1, only False is valid; when num_layers == 1, both are valid
+                    cp.Value.In(lambda deps: [True, False] if deps[0] == 1 else [False]),
+                ],
+            ),
+        ],
+        outspec=[
+            OutArg(ArgType.Tensor, name="output"),
+            OutArg(ArgType.Tensor, name="h_n"),
+            OutArg(ArgType.Tensor, name="c_n"),
+        ],
+    ),
+    Spec(
+        op="lstm.input",  # (Tensor input, Tensor[] hx, Tensor[] params, bool has_biases, int num_layers, float dropout, bool train, bool bidirectional, bool batch_first) -> (Tensor, Tensor, Tensor)
+        # Similar to lstm.data but for regular (non-packed) sequences
+        # Key differences: input is 3D tensor, has batch_first flag
+        inspec=[
+            # input: (seq_len, batch, input_size) or (batch, seq_len, input_size) if batch_first
+            InPosArg(
+                ArgType.Tensor,
+                name="input",
+                deps=[1],  # [hx] - to get dtype from hx
+                constraints=[
+                    cp.Dtype.Eq(lambda deps: deps[0][0].dtype),
+                    cp.Rank.Eq(lambda deps: 3),
+                    # Fix sizes: seq_len=10, batch=10, input_size=8
+                    cp.Size.Eq(lambda deps, r, d: 10 if d == 0 else None),
+                    cp.Size.Eq(lambda deps, r, d: 10 if d == 1 else None),
+                    cp.Size.Eq(lambda deps, r, d: 8 if d == 2 else None),
+                ],
+            ),
+            # hx: [h_0, c_0] initial hidden and cell states
+            # Shape: (num_layers * num_directions, batch, hidden_size)
+            InPosArg(
+                ArgType.TensorList,
+                name="hx",
+                deps=[4, 7],  # [num_layers, bidirectional]
+                constraints=[
+                    cp.Length.Eq(lambda deps: 2),
+                    cp.Dtype.In(lambda deps: dt._floating),
+                    cp.Rank.Eq(lambda deps, length, ix: 3),
+                    # dim 0: num_layers * num_directions
+                    cp.Size.Eq(lambda deps, r, d: deps[0] * (2 if deps[1] else 1) if d == 0 else None),
+                    # dim 1: batch = 10
+                    cp.Size.Eq(lambda deps, r, d: 10 if d == 1 else None),
+                    # dim 2: hidden_size = 8
+                    cp.Size.Eq(lambda deps, r, d: 8 if d == 2 else None),
+                ],
+            ),
+            # params: weight and bias tensors
+            # Structure per layer per direction: [w_ih, w_hh] or [w_ih, w_hh, b_ih, b_hh]
+            InPosArg(
+                ArgType.TensorList,
+                name="params",
+                deps=[0, 1, 3, 4, 7],  # [input, hx, has_biases, num_layers, bidirectional]
+                constraints=[
+                    cp.Dtype.Eq(lambda deps: deps[0].dtype),
+                    # Length: (4 if has_biases else 2) * num_layers * num_directions
+                    cp.Length.Eq(lambda deps: (4 if deps[2] else 2) * deps[3] * (2 if deps[4] else 1)),
+                    # Rank: weights are rank 2, biases are rank 1
+                    cp.Rank.Eq(lambda deps, length, ix: 2 if (ix % (4 if deps[2] else 2)) < 2 else 1),
+                    # Size dim 0: 4 * hidden_size = 32
+                    cp.Size.Eq(lambda deps, r, d: 32 if d == 0 else None),
+                    # Size dim 1: input_size = hidden_size = 8
+                    cp.Size.Eq(lambda deps, r, d: deps[0].size(2) if d == 1 else None),
+                ],
+            ),
+            # has_biases: whether bias tensors are included in params
+            InPosArg(ArgType.Bool, name="has_biases"),
+            # num_layers: allow >= 1 (multi-layer supported for unidirectional)
+            InPosArg(
+                ArgType.Int,
+                name="num_layers",
+                constraints=[cp.Value.Ge(lambda deps: 1)],
+            ),
+            # dropout: probability (only applied between layers if num_layers > 1)
+            InPosArg(
+                ArgType.Float,
+                name="dropout",
+                constraints=[
+                    cp.Value.Ge(lambda deps: 0.0),
+                    cp.Value.Le(lambda deps: 1.0),
+                ],
+            ),
+            InPosArg(ArgType.Bool, name="train"),
+            # bidirectional: only allow True when num_layers == 1
+            # (multi-layer bidirectional has different w_ih sizes for layer 0 vs layer 1+)
+            InPosArg(
+                ArgType.Bool,
+                name="bidirectional",
+                deps=[4],  # [num_layers]
+                constraints=[
+                    cp.Value.In(lambda deps: [True, False] if deps[0] == 1 else [False]),
+                ],
+            ),
+            InPosArg(ArgType.Bool, name="batch_first"),
+        ],
+        outspec=[
+            OutArg(ArgType.Tensor, name="output"),
+            OutArg(ArgType.Tensor, name="h_n"),
+            OutArg(ArgType.Tensor, name="c_n"),
         ],
     ),
     Spec(
@@ -5085,6 +5395,154 @@ SpecDB = [
         ],
     ),
     Spec(
+        op="special_zeta.default",  # (Tensor self, Tensor other) -> Tensor
+        inspec=[
+            InPosArg(
+                ArgType.Tensor,
+                name="self",
+                constraints=[
+                    cp.Dtype.In(lambda deps: [torch.float, torch.double]),
+                ],
+            ),
+            InPosArg(
+                ArgType.Tensor,
+                name="other",
+                deps=[0],
+                constraints=[
+                    cp.Dtype.Eq(lambda deps: deps[0].dtype),
+                    cp.Size.In(
+                        lambda deps, r, d: fn.broadcast_with(deps[0].shape, r, d)
+                    ),
+                ],
+            ),
+        ],
+        outspec=[OutArg(ArgType.Tensor)],
+    ),
+    Spec(
+        op="svd.default",  # (Tensor self, bool some, bool compute_uv) -> (Tensor, Tensor, Tensor)
+        inspec=[
+            InPosArg(
+                ArgType.Tensor,
+                name="self",
+                constraints=[
+                    cp.Dtype.In(lambda deps: [torch.float, torch.double]),
+                    cp.Rank.Ge(lambda deps: 2),
+                ],
+            ),
+            InPosArg(ArgType.Bool, name="some"),
+            InPosArg(ArgType.Bool, name="compute_uv"),
+        ],
+        outspec=[
+            OutArg(ArgType.Tensor, name="U"),
+            OutArg(ArgType.Tensor, name="S"),
+            OutArg(ArgType.Tensor, name="V"),
+        ],
+    ),
+    Spec(
+        op="linalg_svd.default",  # (Tensor A, bool full_matrices=True, str? driver=None) -> (Tensor U, Tensor S, Tensor Vh)
+        inspec=[
+            InPosArg(
+                ArgType.Tensor,
+                name="A",
+                constraints=[
+                    # Support both real and complex dtypes
+                    cp.Dtype.In(lambda deps: [
+                        torch.float32, torch.float64,
+                        torch.complex64, torch.complex128
+                    ]),
+                    # Matrix or batch of matrices
+                    cp.Rank.Ge(lambda deps: 2),
+                    # Last two dimensions must be >= 1 (valid matrix)
+                    cp.Size.Ge(lambda deps, r, d: 1 if d >= r - 2 else None),
+                ],
+            ),
+            InPosArg(
+                ArgType.Bool,
+                name="full_matrices",
+            ),
+            InKwArg(
+                ArgType.StringOpt,
+                name="driver",
+                # Optional: can be "gesvd", "gesvdj", "gesvda"
+                #
+                # Driver is only available if CUDA is available.
+                constraints=[
+                    cp.Value.In(lambda deps: ["gesvd", "gesvdj", "gesvda"] if torch.cuda.is_available() else []),
+                ],
+            ),
+        ],
+        outspec=[
+            OutArg(ArgType.Tensor, name="U"),
+            OutArg(ArgType.Tensor, name="S"),
+            OutArg(ArgType.Tensor, name="Vh"),
+        ],
+    ),
+    Spec(
+        op="linalg_solve_triangular.default",  # (Tensor A, Tensor B, *, bool upper, bool left=True, bool unitriangular=False) -> Tensor
+        inspec=[
+            InPosArg(
+                ArgType.Tensor,
+                name="A",
+                deps=[1, 3], # B, left
+                constraints=[
+                    # Same dtype as A
+                    cp.Dtype.Eq(lambda deps: deps[0].dtype),
+                    # Matrix or batch of matrices
+                    cp.Rank.Ge(lambda deps: 2),
+                    # Must be square: A.size(-1) == A.size(-2)
+                    # Fix both last dimensions to same value to ensure square matrix
+                    # cp.Size.Eq(lambda deps, r, d: 8 if d >= r - 2 else None),
+                    # B.size(-2) must equal A.size(-1) for left=True (simplified: assume left=True)
+                    # For simplicity, match the last two dims with A
+                    cp.Size.Eq(
+                        lambda deps, r, d: (
+                            fn.safe_size(deps[0], -2 if deps[1] else -1)
+                            if d == r - 2 or d == r - 1
+                            else None
+                        )
+                    ),
+                    # Batch dimensions must be broadcastable with B
+                    cp.Size.In(
+                        lambda deps, r, d: (
+                            fn.broadcast_with(deps[0].shape[:-2], r - 2, d)
+                            if d < r - 2
+                            else None
+                        )
+                    ),                    
+                ],
+            ),
+            InPosArg(
+                ArgType.Tensor,
+                name="B",
+                constraints=[
+                    # Support both real and complex dtypes
+                    cp.Dtype.In(lambda deps: [
+                        torch.float32, torch.float64,
+                        torch.complex64, torch.complex128
+                    ]),
+                    # At least 1D (vector or matrix)
+                    cp.Rank.Ge(lambda deps: 1),
+                ],
+            ),
+            InKwArg(
+                ArgType.Bool,
+                name="upper",
+                # Required: whether A is upper triangular
+            ),
+            InKwArg(
+                ArgType.Bool,
+                name="left",
+                # Default True: solve AX = B (True) or XA = B (False)
+            ),
+            InKwArg(
+                ArgType.Bool,
+                name="unitriangular",
+                # Default False: whether to assume diagonal is 1
+            ),
+        ],
+        outspec=[OutArg(ArgType.Tensor, name="X")],
+    ),
+    Spec(
         op="t_copy.default",  # (Tensor self) -> Tensor
         inspec=[
             InPosArg(
@@ -5169,6 +5627,49 @@ SpecDB = [
         ],
         outspec=[
             OutArg(ArgType.Tensor),
+        ],
+    ),
+    Spec(
+        op="triangular_solve.default",  # (Tensor self, Tensor A, bool upper=True, bool transpose=False, bool unitriangular=False) -> (Tensor solution, Tensor cloned_coefficient)
+        inspec=[
+            InPosArg(
+                ArgType.Tensor,
+                name="self",                
+                constraints=[
+                    cp.Dtype.In(lambda deps: [torch.float, torch.double]),
+                    cp.Rank.Ge(lambda deps: 2),   
+                ],
+            ),
+            InPosArg(
+                ArgType.Tensor,
+                name="A",
+                deps=[0],
+                constraints=[
+                    cp.Dtype.Eq(lambda deps: deps[0].dtype),
+                    cp.Rank.Ge(lambda deps: 2),
+                    cp.Size.Eq(
+                        lambda deps, r, d: (
+                            fn.safe_size(deps[0], -2)
+                            if d == r - 1 or d == r - 2
+                            else None
+                        )
+                    ),
+                    cp.Size.In(
+                        lambda deps, r, d: (
+                            fn.broadcast_with(deps[0].shape, r, d)
+                            if d != r - 1 and d != r - 2
+                            else None
+                        )
+                    ),                                             
+                ],
+            ),
+            InPosArg(ArgType.Bool, name="upper"),
+            InPosArg(ArgType.Bool, name="transpose"),
+            InPosArg(ArgType.Bool, name="unitriangular"),
+        ],
+        outspec=[
+            OutArg(ArgType.Tensor, name="solution"),
+            OutArg(ArgType.Tensor, name="cloned_coefficient"),
         ],
     ),
     Spec(
@@ -5323,6 +5824,43 @@ SpecDB = [
                     cp.Value.Le(
                         lambda deps, length, ix: 10.0
                     ),  # restrict to avoid storage overflow
+                ],
+            ),
+        ],
+        outspec=[OutArg(ArgType.Tensor)],
+    ),
+    Spec(
+        op="upsample_bicubic2d.default",  # (Tensor input, int[2] output_size, bool align_corners, float? scales_h=None, float? scales_w=None) -> Tensor
+        inspec=[
+            InPosArg(
+                ArgType.Tensor,
+                name="input",
+                constraints=[
+                    cp.Dtype.In(lambda deps: dt._floating),
+                    cp.Rank.Eq(lambda deps: 4),
+                ],
+            ),
+            InPosArg(
+                ArgType.Shape,
+                name="output_size",
+                constraints=[
+                    cp.Length.Eq(lambda deps: 2),
+                    cp.Value.Ge(lambda deps, length, ix: 1),
+                ],
+            ),
+            InPosArg(ArgType.Bool, name="align_corners"),
+            InPosArg(
+                ArgType.FloatOpt,
+                name="scales_h",
+                constraints=[
+                    cp.Value.Gt(lambda deps: 0.0),
+                ],
+            ),
+            InPosArg(
+                ArgType.FloatOpt,
+                name="scales_w",
+                constraints=[
+                    cp.Value.Gt(lambda deps: 0.0),
                 ],
             ),
         ],
