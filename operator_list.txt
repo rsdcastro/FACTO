@@ -1,0 +1,11 @@
+binary_cross_entropy_backward.default
+flip.default
+hardshrink.default
+lstm.input
+lstm.data
+special_zeta.default
+svd.default
+linalg_svd.default
+triangular_solve.default
+linalg_solve_triangular.default
+upsample_bicubic2d.default
